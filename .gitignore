@@ -1,0 +1,11 @@
+
+.venv/
+__pycache__/
+*.pyc
+.env
+.vscode/
+data_clean/
+hasil_analisis/
+hasil_clustering/
+hasil_evaluasi/
+tracks_features.csv
