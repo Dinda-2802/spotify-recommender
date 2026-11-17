@@ -17,7 +17,7 @@ INPUT_FILE = os.path.join(
 
 TEMP_DIR = r"D:\spark_temp"
 
-BATAS_UJI = 100_000
+BATAS_UJI = None
 
 os.environ["TEMP"] = TEMP_DIR
 os.environ["TMP"] = TEMP_DIR
@@ -46,15 +46,8 @@ try:
     print("=" * 55)
 
     # ==========================================
-    # 3. MEMBACA DATASET BERSIH
+    # 3. MEMBACA DATASET
     # ==========================================
-
-    if not os.path.isfile(INPUT_FILE):
-        raise FileNotFoundError(
-            f"Dataset tidak ditemukan: {INPUT_FILE}"
-        )
-
-    print("\nMembaca dataset bersih...")
 
     df = (
         spark.read
@@ -63,6 +56,30 @@ try:
         .option("escape", '"')
         .csv(INPUT_FILE)
     )
+
+    print("\nKolom dataset:")
+    print(df.columns)
+
+    # Menyesuaikan nama kolom identitas
+    kolom_nama = (
+        "track_name" if "track_name" in df.columns
+        else "name"
+    )
+
+    kolom_id = (
+        "track_id" if "track_id" in df.columns
+        else None
+    )
+
+    identitas = [
+        kolom for kolom in [
+            kolom_id,
+            kolom_nama,
+            "artists",
+            "album_name"
+        ]
+        if kolom is not None and kolom in df.columns
+    ]
 
     fitur_audio = [
         "danceability",
@@ -76,21 +93,39 @@ try:
         "tempo"
     ]
 
-    # Uji awal menggunakan maksimal 100.000 baris
-    df = df.limit(BATAS_UJI)
+    # Pastikan seluruh fitur tersedia
+    kolom_wajib = identitas + fitur_audio
+    kolom_hilang = [
+        kolom for kolom in kolom_wajib
+        if kolom not in df.columns
+    ]
+
+    if kolom_hilang:
+        raise ValueError(
+            f"Kolom tidak ditemukan: {kolom_hilang}"
+        )
 
     # ==========================================
-    # 4. MENGUBAH FITUR MENJADI ANGKA
+    # 4. MEMBATASI DATA UJI
+    # ==========================================
+
+    df = df.select(*kolom_wajib)
+
+    if BATAS_UJI is not None:
+        df = df.limit(BATAS_UJI)
+
+    # ==========================================
+    # 5. KONVERSI FITUR NUMERIK
     # ==========================================
 
     for kolom in fitur_audio:
         df = df.withColumn(
             kolom,
-            F.expr(f"try_cast(`{kolom}` AS DOUBLE)")
+            F.col(kolom).cast("double")
         )
 
     # ==========================================
-    # 5. MEMERIKSA VALIDITAS FITUR
+    # 6. VALIDASI DATA
     # ==========================================
 
     kondisi_valid = F.lit(True)
@@ -102,7 +137,6 @@ try:
             & ~F.isnan(F.col(kolom))
         )
 
-    # Fitur berikut seharusnya berada pada rentang 0 sampai 1
     fitur_rentang = [
         "danceability",
         "energy",
@@ -119,26 +153,31 @@ try:
             & F.col(kolom).between(0, 1)
         )
 
-    # Tempo harus bernilai positif
-    kondisi_valid = kondisi_valid & (F.col("tempo") > 0)
+    kondisi_valid = (
+        kondisi_valid
+        & (F.col("tempo") > 0)
+    )
+
+    # Memastikan loudness bernilai finite
+    kondisi_valid = (
+        kondisi_valid
+        & (F.abs(F.col("loudness")) < float("inf"))
+    )
 
     df_valid = df.filter(kondisi_valid)
 
     jumlah_uji = df.count()
     jumlah_valid = df_valid.count()
 
-    print("\nJumlah baris yang diuji :", jumlah_uji)
-    print("Jumlah baris valid      :", jumlah_valid)
-    print("Jumlah baris tidak valid:", jumlah_uji - jumlah_valid)
+    print("\nJumlah data diuji :", jumlah_uji)
+    print("Jumlah data valid :", jumlah_valid)
+    print("Tidak valid       :", jumlah_uji - jumlah_valid)
 
     if jumlah_valid == 0:
-        raise ValueError(
-            "Tidak ada baris valid. Periksa nama kolom "
-            "dan nilai fitur dalam dataset."
-        )
+        raise ValueError("Tidak ditemukan data valid.")
 
     # ==========================================
-    # 6. MENGGABUNGKAN FITUR AUDIO
+    # 7. VECTOR ASSEMBLER
     # ==========================================
 
     assembler = VectorAssembler(
@@ -150,10 +189,10 @@ try:
     data_vektor = assembler.transform(df_valid)
 
     # ==========================================
-    # 7. STANDARDISASI FITUR
+    # 8. STANDARDISASI FITUR
     # ==========================================
 
-    print("\nMelakukan standardisasi fitur audio...")
+    print("\nMelakukan standardisasi...")
 
     scaler = StandardScaler(
         inputCol="fitur_mentah",
@@ -163,30 +202,45 @@ try:
     )
 
     model_scaler = scaler.fit(data_vektor)
+
     data_standar = model_scaler.transform(data_vektor)
 
     # ==========================================
-    # 8. MENAMPILKAN HASIL UJI
+    # 9. MENYIMPAN HASIL STANDARDISASI
     # ==========================================
 
-    print("\nContoh hasil persiapan fitur:")
+    OUTPUT_DIR = os.path.join(
+        BASE_DIR, "hasil_persiapan_fitur"
+    )
 
-    data_standar.select(
-        "name",
-        "artists",
-        "fitur_standar"
-    ).show(5, truncate=50)
+    print("\nMenyimpan hasil standardisasi...")
 
+    (
+        data_standar
+        .select(
+            *identitas,
+            *fitur_audio,
+            "fitur_standar"
+        )
+        .write
+        .mode("overwrite")
+        .parquet(OUTPUT_DIR)
+    )
+
+    print("Hasil berhasil disimpan:", OUTPUT_DIR)
+
+    # ==========================================
+    # 10. MENAMPILKAN HASIL
+    # ==========================================
     print("\n" + "=" * 55)
     print("PERSIAPAN FITUR BERHASIL")
     print("=" * 55)
 
-    print("Fitur audio:", ", ".join(fitur_audio))
-    print("Batas uji:", f"{BATAS_UJI:,}", "baris")
-    print(
-        "\nCatatan: ini masih uji awal, "
-        "belum merupakan model rekomendasi."
-    )
+    print("Jumlah fitur :", len(fitur_audio))
+    print("Jumlah data  :", f"{jumlah_valid:,}")
+    print("Batas uji    :", BATAS_UJI)
+
+    print("Output       :", OUTPUT_DIR)
 
 except Exception as e:
     print("\nPROSES GAGAL:", str(e))

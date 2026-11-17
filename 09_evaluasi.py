@@ -4,6 +4,7 @@ import sys
 import time
 import glob
 import argparse
+import json
  
 import numpy as np
 import pandas as pd
@@ -15,6 +16,8 @@ import pandas as pd
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 INPUT_CLEAN = os.path.join(BASE_DIR, "data_clean", "tracks_clean.csv")
 CLUSTER_DIR = os.path.join(BASE_DIR, "hasil_clustering", "lagu_dengan_cluster")
+TEST_DIR = os.path.join(BASE_DIR, "hasil_clustering", "hasil_prediksi_testing")
+MODEL_JSON = os.path.join(BASE_DIR, "hasil_clustering", "model_kmeans.json")
 OUT_DIR = os.path.join(BASE_DIR, "hasil_evaluasi")
 TEMP_DIR = os.environ.get("SPARK_TEMP_DIR", r"D:\spark_temp")
  
@@ -33,6 +36,7 @@ FITUR_0_1 = [
 K_MIN, K_MAX = 2, 12
 UKURAN_SAMPEL_SPARK = 150_000   # jumlah lagu yang dipakai untuk memilih k
 UKURAN_SAMPEL_DBI = 30_000      # DBI dihitung pada sampel yang lebih kecil
+UKURAN_SAMPEL_SILUET = 5_000   # batas sampel untuk silhouette
 MAX_ITER_K = 20
  
 # Bagian B
@@ -149,12 +153,18 @@ def evaluasi_k():
  
         df_valid = df.filter(valid).select(*FITUR_AUDIO)
  
-        total = df_valid.count()
-        frac = min(1.0, UKURAN_SAMPEL_SPARK / total)
-        print(f"Lagu valid        : {total:,}")
-        print(f"Sampel dipakai    : sekitar {int(total * frac):,} lagu ({frac:.1%})")
- 
-        sampel = df_valid.sample(False, frac, seed=SEED).cache()
+        # Split identik dengan file 05; pemilihan k hanya dari data training.
+        train_df, test_df = df_valid.randomSplit([0.8, 0.2], seed=SEED)
+        jumlah_train = train_df.count()
+        jumlah_test = test_df.count()
+
+        frac = min(1.0, UKURAN_SAMPEL_SPARK / jumlah_train)
+        print(f"Lagu valid        : {jumlah_train + jumlah_test:,}")
+        print(f"Data training     : {jumlah_train:,}")
+        print(f"Data testing      : {jumlah_test:,}")
+        print(f"Sampel pemilihan k: sekitar {min(UKURAN_SAMPEL_SPARK, jumlah_train):,} lagu training")
+
+        sampel = train_df.sample(False, frac, seed=SEED).cache()
         n = sampel.count()
  
         vec = VectorAssembler(inputCols=FITUR_AUDIO, outputCol="fitur_mentah").transform(sampel)
@@ -411,18 +421,142 @@ def evaluasi_rekomendasi():
     print("\nSelesai. Hasil ada di:", OUT_DIR)
  
  
+
+
 # ==================================================
-# 5. MAIN
+# 5. BAGIAN C - EVALUASI PREDIKSI PADA DATA TESTING
+# ==================================================
+
+def baca_hasil_testing():
+    files = sorted(glob.glob(os.path.join(TEST_DIR, "part-*.csv")))
+    if not files:
+        raise FileNotFoundError(
+            f"Hasil prediksi testing tidak ditemukan di {TEST_DIR}\n"
+            "Jalankan 05_clustering_kmeans.py versi train/test terlebih dahulu."
+        )
+    df = pd.concat(
+        [pd.read_csv(f, encoding="utf-8-sig", low_memory=False) for f in files],
+        ignore_index=True,
+    )
+    perlu = ["cluster"] + FITUR_AUDIO
+    hilang = [c for c in perlu if c not in df.columns]
+    if hilang:
+        raise ValueError(f"Kolom tidak ditemukan pada hasil testing: {hilang}")
+    for c in FITUR_AUDIO + ["cluster"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=FITUR_AUDIO + ["cluster"]).copy()
+    df = df[np.isfinite(df[FITUR_AUDIO]).all(axis=1)]
+    df["cluster"] = df["cluster"].astype(int)
+    return df.reset_index(drop=True), len(files)
+
+
+def evaluasi_testing():
+    print("\n" + "=" * 60)
+    print("BAGIAN C - Evaluasi prediksi pada data testing")
+    print("=" * 60)
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    if not os.path.isfile(MODEL_JSON):
+        raise FileNotFoundError(
+            f"Parameter model tidak ditemukan: {MODEL_JSON}. "
+            "Pastikan file 05 menyimpan model_kmeans.json."
+        )
+    with open(MODEL_JSON, "r", encoding="utf-8") as f:
+        parameter = json.load(f)
+
+    # Gunakan scaler dari training, jangan fit ulang pada data testing.
+    mean = np.asarray(parameter["scaler_mean"], dtype=np.float64)
+    std = np.asarray(parameter["scaler_std"], dtype=np.float64)
+    if len(mean) != len(FITUR_AUDIO) or len(std) != len(FITUR_AUDIO):
+        raise ValueError(f"scaler_mean dan scaler_std harus memiliki {len(FITUR_AUDIO)} nilai.")
+    std[std == 0] = 1.0
+
+    df, jumlah_part = baca_hasil_testing()
+    if len(df) < 2:
+        raise ValueError("Data testing valid kurang dari 2 baris.")
+    print(f"Baris testing valid: {len(df):,} (dari {jumlah_part} file part)")
+
+    X = df[FITUR_AUDIO].to_numpy(dtype=np.float64)
+    Z = (X - mean) / std
+    y = df["cluster"].to_numpy(dtype=int)
+    rng = np.random.default_rng(SEED)
+
+    # Silhouette dihitung pada sampel kecil karena kompleksitas komputasinya tinggi.
+    n_sil = min(UKURAN_SAMPEL_SILUET, len(df))
+    idx_sil = rng.choice(len(df), size=n_sil, replace=False) if n_sil < len(df) else np.arange(len(df))
+    sil = float("nan")
+    try:
+        from sklearn.metrics import silhouette_score
+    except ImportError as e:
+        raise ImportError("Bagian C memerlukan scikit-learn: pip install scikit-learn") from e
+    y_sil = y[idx_sil]
+    if 1 < len(np.unique(y_sil)) < len(y_sil):
+        sil = float(silhouette_score(Z[idx_sil], y_sil, metric="euclidean"))
+
+    # DBI pada subset test; pusat cluster dihitung dari data test yang terpilih.
+    n_dbi = min(UKURAN_SAMPEL_DBI, len(df))
+    idx_dbi = rng.choice(len(df), size=n_dbi, replace=False) if n_dbi < len(df) else np.arange(len(df))
+    X_dbi, y_dbi = Z[idx_dbi], y[idx_dbi]
+    cluster_dbi = np.unique(y_dbi)
+    dbi = float("nan")
+    if len(cluster_dbi) >= 2:
+        pusat = np.vstack([X_dbi[y_dbi == c].mean(axis=0) for c in cluster_dbi])
+        remap = {c: i for i, c in enumerate(cluster_dbi)}
+        label = np.array([remap[c] for c in y_dbi], dtype=int)
+        dbi = davies_bouldin(X_dbi, label, pusat)
+
+    distribusi = (
+        df["cluster"].value_counts().sort_index()
+        .rename_axis("cluster").reset_index(name="jumlah_lagu")
+    )
+    distribusi.to_csv(
+        os.path.join(OUT_DIR, "distribusi_cluster_testing.csv"),
+        index=False, encoding="utf-8-sig",
+    )
+
+    ringkasan = [
+        ("jumlah_data_testing", len(df), "Jumlah baris testing valid"),
+        ("jumlah_cluster_terprediksi", int(df["cluster"].nunique()), "Jumlah cluster yang muncul pada prediksi testing"),
+        ("silhouette_testing", sil, f"Sampel maksimal {UKURAN_SAMPEL_SILUET:,}; semakin tinggi semakin baik"),
+        ("davies_bouldin_testing", dbi, f"Sampel maksimal {UKURAN_SAMPEL_DBI:,}; semakin rendah semakin baik"),
+        ("jumlah_sampel_silhouette", len(idx_sil), "Jumlah baris untuk Silhouette"),
+        ("jumlah_sampel_dbi", len(idx_dbi), "Jumlah baris untuk Davies-Bouldin"),
+    ]
+    pd.DataFrame(ringkasan, columns=["metrik", "nilai", "keterangan"]).to_csv(
+        os.path.join(OUT_DIR, "evaluasi_testing.csv"),
+        index=False, encoding="utf-8-sig",
+    )
+
+    print("\nHASIL EVALUASI TESTING")
+    for nama, nilai, ket in ringkasan:
+        if isinstance(nilai, (float, np.floating)):
+            tampil = f"{nilai:.4f}" if np.isfinite(nilai) else "NaN"
+        else:
+            tampil = f"{nilai:,}" if isinstance(nilai, (int, np.integer)) else str(nilai)
+        print(f"  {nama:<32} {tampil:>12}   {ket}")
+    print("\nFile tersimpan:")
+    print(" ", os.path.join(OUT_DIR, "evaluasi_testing.csv"))
+    print(" ", os.path.join(OUT_DIR, "distribusi_cluster_testing.csv"))
+
+
+# ==================================================
+# 6. MAIN
 # ==================================================
  
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Evaluasi sistem rekomendasi Spotify")
-    ap.add_argument("--lewati-k", action="store_true", help="lewati Bagian A (Spark, memilih k)")
+    ap.add_argument("--lewati-k", action="store_true", help="lewati Bagian A (pemilihan k)")
     ap.add_argument("--hanya-k", action="store_true", help="hanya jalankan Bagian A")
+    ap.add_argument("--lewati-testing", action="store_true", help="lewati Bagian C")
+    ap.add_argument("--hanya-testing", action="store_true", help="hanya jalankan Bagian C")
     arg = ap.parse_args()
- 
-    if not arg.lewati_k:
-        evaluasi_k()
-    if not arg.hanya_k:
-        evaluasi_rekomendasi()
- 
+
+    if arg.hanya_testing:
+        evaluasi_testing()
+    else:
+        if not arg.lewati_k:
+            evaluasi_k()
+        if not arg.hanya_k:
+            evaluasi_rekomendasi()
+        if not arg.lewati_testing:
+            evaluasi_testing()
