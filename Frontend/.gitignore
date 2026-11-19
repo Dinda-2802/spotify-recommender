@@ -21,3 +21,13 @@ logs/
 # beside it.
 /.plugins/
 /.opencode-skills/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# File konfigurasi contoh
+!.env.example
+!.env.local.example

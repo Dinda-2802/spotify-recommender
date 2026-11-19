@@ -1,7 +1,5 @@
-import SpotifyAnalyticsApp from '@/components/spotify/SpotifyAnalyticsApp'
-import { getSpotifyEngine } from '@/lib/spotify-engine'
+import SplashScreen from '@/components/spotify/SplashScreen'
 
 export default function HomePage() {
-  const initialOverview = getSpotifyEngine().overview()
-  return <SpotifyAnalyticsApp initialOverview={initialOverview} />
+  return <SplashScreen />
 }

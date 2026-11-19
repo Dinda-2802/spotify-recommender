@@ -27,8 +27,14 @@ import {
   Smile,
   Wind,
   CloudRain,
+  UserRound,
+  History,
+  LogOut,
 } from 'lucide-react'
 import Image from 'next/image'
+import { useRouter } from 'next/navigation'
+import { getDemoSession, logoutDemo, type DemoUser } from '@/lib/demo-auth'
+import { recordDemoActivity, recordDemoSearch, recordDemoRecommendation } from '@/lib/demo-history'
 import {
   useCallback,
   useEffect,
@@ -53,6 +59,13 @@ import {
   ScatterChart,
   TimingChart,
 } from './charts'
+import {
+  UserProfilePage,
+  RecommendationHistoryPage,
+  SearchHistoryPage,
+  UserActivityPage,
+} from './UserWorkspacePages'
+import EvaluationDetailQueryModal from './EvaluationDetailQueryModal'
 
 type PageKey =
   | 'dashboard'
@@ -60,6 +73,10 @@ type PageKey =
   | 'recommendation'
   | 'mood'
   | 'evaluation'
+  | 'profile'
+  | 'recommendationHistory'
+  | 'searchHistory'
+  | 'userActivity'
 
 type ClusterSampleResponse = {
   cluster: number
@@ -69,7 +86,7 @@ type ClusterSampleResponse = {
   source: 'dataset' | 'demo'
 }
 
-const NAVIGATION = [
+const ANALYTICS_NAVIGATION = [
   { key: 'dashboard' as const, label: 'Dashboard', icon: BarChart3 },
   { key: 'cluster' as const, label: 'Cluster Analysis', icon: Layers3 },
   { key: 'recommendation' as const, label: 'Music Recommendation', icon: ListMusic },
@@ -77,10 +94,17 @@ const NAVIGATION = [
   { key: 'evaluation' as const, label: 'Evaluation', icon: Gauge },
 ]
 
+const USER_NAVIGATION = [
+  { key: 'profile' as const, label: 'Profil Pengguna', icon: UserRound },
+  { key: 'recommendationHistory' as const, label: 'Riwayat Rekomendasi', icon: History },
+  { key: 'searchHistory' as const, label: 'Riwayat Pencarian', icon: Search },
+  { key: 'userActivity' as const, label: 'Aktivitas Pengguna', icon: Activity },
+]
+
 const PAGE_META: Record<PageKey, { eyebrow: string; title: string; description: string }> = {
   dashboard: {
     eyebrow: 'Workspace overview',
-    title: 'Spotify Analytics Dashboard',
+    title: 'Ritmelika Dashboard',
     description:
       'Ringkasan katalog, distribusi fitur audio, dan hasil clustering dalam satu workspace.',
   },
@@ -107,6 +131,26 @@ const PAGE_META: Record<PageKey, { eyebrow: string; title: string; description: 
     title: 'Model Evaluation',
     description:
       'Tinjau kualitas cluster, waktu pencarian, dan hasil pengujian sistem.',
+  },
+  profile: {
+    eyebrow: 'User workspace',
+    title: 'Profil Pengguna',
+    description: 'Identitas pengguna dan informasi akun yang akan terhubung ke Firebase.',
+  },
+  recommendationHistory: {
+    eyebrow: 'User workspace',
+    title: 'Riwayat Rekomendasi',
+    description: 'Rekomendasi yang pernah dihasilkan untuk pengguna setelah login.',
+  },
+  searchHistory: {
+    eyebrow: 'User workspace',
+    title: 'Riwayat Pencarian',
+    description: 'Daftar pencarian lagu yang akan disimpan di Firestore.',
+  },
+  userActivity: {
+    eyebrow: 'User workspace',
+    title: 'Aktivitas Pengguna',
+    description: 'Ringkasan aktivitas pengguna selama menggunakan aplikasi.',
   },
 }
 
@@ -638,6 +682,7 @@ function RecommendationPage({ overview }: { overview: OverviewData }) {
   const [searching, setSearching] = useState(false)
   const [recommending, setRecommending] = useState(false)
   const [error, setError] = useState('')
+  const [historyWarning, setHistoryWarning] = useState('')
   const searchBoxRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -668,6 +713,7 @@ function RecommendationPage({ overview }: { overview: OverviewData }) {
     if (!selected) return
     setRecommending(true)
     setError('')
+    setHistoryWarning('')
     try {
       const response = await fetch('/api/spotify/recommend', {
         body: JSON.stringify({ index: selected.index, amount, mode }),
@@ -677,6 +723,9 @@ function RecommendationPage({ overview }: { overview: OverviewData }) {
       const body = await response.json()
       if (!response.ok) throw new Error(body.error || 'Rekomendasi gagal')
       setRecommendation(body)
+      if (!recordDemoRecommendation({ seed: selected, mode, requested: amount, results: body.results })) {
+        setHistoryWarning('Rekomendasi berhasil, tetapi riwayat gagal disimpan. Periksa penyimpanan browser atau sesi login demo.')
+      }
     } catch (requestError) {
       setError(
         requestError instanceof Error
@@ -692,6 +741,7 @@ function RecommendationPage({ overview }: { overview: OverviewData }) {
     <div className="space-y-6">
       <PageIntro overview={overview} page="recommendation" />
       <DemoNotice overview={overview} />
+      {historyWarning && <p role="alert" className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800">{historyWarning}</p>}
       <div className="grid gap-4 xl:grid-cols-[1.35fr_0.65fr]">
         <Card className="relative" >
           <CardHeader
@@ -733,6 +783,8 @@ function RecommendationPage({ overview }: { overview: OverviewData }) {
                     className="flex w-full items-center justify-between gap-4 border-b border-zinc-100 px-4 py-3 text-left last:border-0 hover:bg-zinc-50"
                     key={song.index}
                     onClick={() => {
+                      const saved = recordDemoSearch(query, song)
+                      setHistoryWarning(saved ? '' : 'Pilihan lagu berhasil, tetapi riwayat pencarian gagal disimpan di browser.')
                       setSelected(song)
                       setQuery(song.name)
                       setResults([])
@@ -1272,66 +1324,6 @@ function MoodExplorerPage({ overview }: { overview: OverviewData }) {
   )
 }
 
-function DetailModal({
-  rows,
-  close,
-}: {
-  rows: Array<Record<string, string>>
-  close: () => void
-}) {
-  const columns = rows.length ? Object.keys(rows[0]) : []
-  return (
-    <div
-      aria-modal="true"
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4"
-      role="dialog"
-    >
-      <div className="flex max-h-[86vh] w-full max-w-6xl flex-col overflow-hidden rounded-xl bg-white shadow-2xl">
-        <div className="flex items-center justify-between border-b border-zinc-200 px-5 py-4">
-          <div>
-            <h2 className="text-base font-bold text-zinc-900">Detail evaluation query</h2>
-            <p className="mt-1 text-xs text-zinc-500">
-              Data aktual dari hasil_evaluasi/detail_query.csv
-            </p>
-          </div>
-          <button
-            aria-label="Tutup detail"
-            className="flex h-9 w-9 items-center justify-center rounded-lg border border-zinc-200 text-zinc-500 hover:bg-zinc-50"
-            onClick={close}
-            type="button"
-          >
-            <X size={17} />
-          </button>
-        </div>
-        <div className="overflow-auto">
-          <table className="w-full min-w-max text-left">
-            <thead className="sticky top-0 bg-zinc-50">
-              <tr className="text-[10px] font-bold uppercase tracking-[0.1em] text-zinc-500">
-                {columns.map((column) => (
-                  <th className="border-b border-zinc-200 px-4 py-3" key={column}>
-                    {column}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-zinc-100">
-              {rows.map((row, index) => (
-                <tr className="text-xs text-zinc-700" key={index}>
-                  {columns.map((column) => (
-                    <td className="whitespace-nowrap px-4 py-3" key={column}>
-                      {row[column]}
-                    </td>
-                  ))}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
-  )
-}
-
 function EvaluationPage({
   overview,
   setOverview,
@@ -1369,9 +1361,10 @@ function EvaluationPage({
   const loadDetail = async () => {
     setError('')
     try {
-      const response = await fetch('/api/spotify/evaluation?detail=1')
+      const response = await fetch('/api/spotify/evaluation-detail', { cache: 'no-store' })
       const body = await response.json()
       if (!response.ok) throw new Error(body.error || 'Detail query gagal dimuat')
+      if (!Array.isArray(body.rows)) throw new Error('Respons tabel query tidak valid')
       setDetailRows(body.rows)
     } catch (requestError) {
       setError(
@@ -1408,12 +1401,11 @@ function EvaluationPage({
         <div className="flex flex-wrap gap-2">
           <button
             className="inline-flex h-9 items-center gap-2 rounded-lg border border-zinc-200 px-3 text-xs font-semibold text-zinc-700 hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-50"
-            disabled={!evaluation.detailAvailable}
             onClick={loadDetail}
             type="button"
           >
             <TableProperties size={14} />
-            Lihat Detail Query
+            Lihat Tabel Query
           </button>
           <button
             className="inline-flex h-9 items-center gap-2 rounded-lg bg-[#5278E8] px-3 text-xs font-semibold text-white hover:bg-[#344FA1]"
@@ -1546,7 +1538,7 @@ function EvaluationPage({
           </table>
         </div>
       </Card>
-      {detailRows && <DetailModal close={() => setDetailRows(null)} rows={detailRows} />}
+      {detailRows && <EvaluationDetailQueryModal close={() => setDetailRows(null)} rows={detailRows} />}
     </div>
   )
 }
@@ -1556,11 +1548,15 @@ function Sidebar({
   mobileOpen,
   setActivePage,
   closeMobile,
+  onLogout,
+  displayName,
 }: {
   activePage: PageKey
   mobileOpen: boolean
   setActivePage: (page: PageKey) => void
   closeMobile: () => void
+  onLogout: () => void
+  displayName: string
 }) {
   const content = (
     <>
@@ -1582,7 +1578,7 @@ function Sidebar({
           </span>
           <span className="text-left">
             <span className="block text-sm font-bold tracking-[-0.02em] text-white">
-              Spotify Analytics
+              Ritmelika
             </span>
             <span className="mt-0.5 block text-[10px] font-semibold uppercase tracking-[0.12em] text-zinc-500">
               Big Data Spark
@@ -1598,41 +1594,59 @@ function Sidebar({
           <X size={17} />
         </button>
       </div>
-      <nav className="flex-1 px-3 py-6">
-        <p className="px-3 text-[10px] font-bold uppercase tracking-[0.16em] text-zinc-600">
-          Analytics
-        </p>
-        <div className="mt-3 space-y-1">
-          {NAVIGATION.map((item) => {
-            const Icon = item.icon
-            const active = activePage === item.key
-            return (
-              <button
-                className={cn(
-                  'group flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm font-semibold transition',
-                  active
-                    ? 'bg-[#344FA1] text-white'
-                    : 'text-[#B7C3EA] hover:bg-[#2A3556] hover:text-white',
-                )}
-                key={item.key}
-                onClick={() => {
-                  setActivePage(item.key)
-                  closeMobile()
-                }}
-                type="button"
-              >
-                <Icon
-                  className={active ? 'text-[#A78BFA]' : 'text-[#7884AD] group-hover:text-[#B7C3EA]'}
-                  size={17}
-                />
-                <span className="flex-1">{item.label}</span>
-                {active && <ChevronRight className="text-zinc-500" size={14} />}
-              </button>
-            )
-          })}
-        </div>
+      <nav aria-label="Navigasi utama" className="min-h-0 flex-1 overflow-y-auto px-3 py-5">
+        {[
+          { title: 'ANALYTICS', items: ANALYTICS_NAVIGATION },
+          { title: 'USER MANAGEMENT', items: USER_NAVIGATION },
+        ].map((group, groupIndex) => (
+          <div className={groupIndex ? 'mt-6' : ''} key={group.title}>
+            <p className="px-3 text-[10px] font-bold uppercase tracking-[0.16em] text-[#8DA0CB]">
+              {group.title}
+            </p>
+            <div className="mt-3 space-y-1">
+              {group.items.map((item) => {
+                const Icon = item.icon
+                const active = activePage === item.key
+                return (
+                  <button
+                    aria-current={active ? 'page' : undefined}
+                    className={cn(
+                      'group flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm font-semibold transition',
+                      active
+                        ? 'bg-[#344FA1] text-white'
+                        : 'text-[#B7C3EA] hover:bg-[#2A3556] hover:text-white',
+                    )}
+                    key={item.key}
+                    onClick={() => {
+                      setActivePage(item.key)
+                      closeMobile()
+                    }}
+                    type="button"
+                  >
+                    <Icon
+                      className={active ? 'text-[#C4B5FD]' : 'text-[#90A1CB] group-hover:text-white'}
+                      size={17}
+                    />
+                    <span className="flex-1">{item.label}</span>
+                    {active && <ChevronRight className="text-white/70" size={14} />}
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+        ))}
       </nav>
       <div className="border-t border-[#35405F] p-4">
+        <div className="mb-3 truncate px-2 text-xs font-semibold text-[#B7C3EA]" title={displayName}>
+          Akun pratinjau: {displayName || 'Pengguna'}
+        </div>
+        <button
+          className="mb-3 flex w-full items-center justify-center gap-2 rounded-lg bg-[#5278E8] px-3 py-2.5 text-sm font-bold text-white transition hover:bg-[#6588EE]"
+          onClick={onLogout}
+          type="button"
+        >
+          <LogOut size={16} /> Logout
+        </button>
         <div className="rounded-lg border border-[#435078] bg-[#293556] p-3">
           <div className="flex items-center gap-2 text-xs font-semibold text-zinc-200">
             <SlidersHorizontal className="text-[#A78BFA]" size={14} />
@@ -1673,12 +1687,23 @@ export default function SpotifyAnalyticsApp({
 }: {
   initialOverview: OverviewData
 }) {
+  const router = useRouter()
   const [activePage, setActivePage] = useState<PageKey>('dashboard')
+  const [currentUser, setCurrentUser] = useState<DemoUser | null>(null)
   const [mobileOpen, setMobileOpen] = useState(false)
   const [overview, setOverview] = useState<OverviewData | null>(initialOverview)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const contentRef = useRef<HTMLDivElement>(null)
+
+  const logout = () => {
+    recordDemoActivity('logout', 'Keluar akun', 'Pengguna keluar dari akun pratinjau.')
+    logoutDemo()
+    router.replace('/login')
+  }
+  useEffect(() => {
+    setCurrentUser(getDemoSession())
+  }, [activePage])
 
   const loadOverview = useCallback(async () => {
     setLoading(true)
@@ -1717,9 +1742,15 @@ export default function SpotifyAnalyticsApp({
       case 'mood':
         return <MoodExplorerPage overview={overview} />
       case 'evaluation':
-        return (
-          <EvaluationPage overview={overview} setOverview={setOverview} />
-        )
+        return <EvaluationPage overview={overview} setOverview={setOverview} />
+      case 'profile':
+        return <UserProfilePage />
+      case 'recommendationHistory':
+        return <RecommendationHistoryPage onOpenRecommendation={() => setActivePage('recommendation')} />
+      case 'searchHistory':
+        return <SearchHistoryPage onOpenRecommendation={() => setActivePage('recommendation')} />
+      case 'userActivity':
+        return <UserActivityPage onOpenRecommendation={() => setActivePage('recommendation')} />
       default:
         return <DashboardPage overview={overview} />
     }
@@ -1732,6 +1763,8 @@ export default function SpotifyAnalyticsApp({
         closeMobile={() => setMobileOpen(false)}
         mobileOpen={mobileOpen}
         setActivePage={setActivePage}
+        onLogout={logout}
+        displayName={currentUser?.displayName || ''}
       />
       <div className="min-w-0 lg:pl-60">
         <header className="sticky top-0 z-30 border-b border-zinc-200 bg-white/95 backdrop-blur-sm">
@@ -1750,11 +1783,18 @@ export default function SpotifyAnalyticsApp({
                   {PAGE_META[activePage].title}
                 </p>
                 <p className="hidden truncate text-xs text-zinc-500 sm:block">
-                  Spotify Recommender · Analytics workspace
+                  Ritmelika Recommender · Analytics workspace
                 </p>
               </div>
             </div>
             <div className="flex items-center gap-2">
+              <button
+                className="inline-flex h-9 items-center gap-2 rounded-lg border border-[#CBD9FF] bg-[#E8F0FF] px-3 text-xs font-bold text-[#344FA1] transition hover:bg-[#D9E6FF]"
+                onClick={() => setActivePage('profile')}
+                type="button"
+              >
+                <UserRound size={14} /> <span className="hidden sm:inline">{currentUser?.displayName || 'Profil'}</span>
+              </button>
               <div className="hidden items-center gap-2 rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-xs font-medium text-zinc-600 sm:flex">
                 <Database size={14} />
                 {overview?.source === 'dataset' ? 'Live dataset' : 'Demo preview'}
