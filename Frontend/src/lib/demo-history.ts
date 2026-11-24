@@ -1,4 +1,17 @@
-import { getDemoSession } from './demo-auth'
+
+import { auth, db } from '@/firebase'
+import { onAuthStateChanged } from 'firebase/auth'
+import {
+  collection,
+  deleteDoc,
+  doc,
+  limit,
+  onSnapshot,
+  orderBy,
+  query,
+  setDoc,
+  type Unsubscribe,
+} from 'firebase/firestore'
 
 export type DemoTrack = {
   index: number
@@ -6,13 +19,19 @@ export type DemoTrack = {
   artists: string
   cluster: number
 }
-export type DemoRecommendedTrack = DemoTrack & { rank: number; similarity: number }
+
+export type DemoRecommendedTrack = DemoTrack & {
+  rank: number
+  similarity: number
+}
+
 export type DemoSearchEntry = {
   id: string
   at: string
   query: string
   track: DemoTrack
 }
+
 export type DemoRecommendationEntry = {
   id: string
   at: string
@@ -21,7 +40,15 @@ export type DemoRecommendationEntry = {
   requested: number
   results: DemoRecommendedTrack[]
 }
-export type DemoActivityKind = 'register' | 'login' | 'logout' | 'search' | 'recommendation' | 'profile'
+
+export type DemoActivityKind =
+  | 'register'
+  | 'login'
+  | 'logout'
+  | 'search'
+  | 'recommendation'
+  | 'profile'
+
 export type DemoActivityEntry = {
   id: string
   at: string
@@ -29,116 +56,144 @@ export type DemoActivityEntry = {
   title: string
   detail: string
 }
+
 export type DemoHistory = {
   searches: DemoSearchEntry[]
   recommendations: DemoRecommendationEntry[]
   activities: DemoActivityEntry[]
 }
+
 export type DemoHistorySection = keyof DemoHistory
 
-const PREFIX = 'spotify-analytics.preview-history.v1:'
 const MAX_SEARCHES = 100
 const MAX_RECOMMENDATIONS = 50
 const MAX_ACTIVITIES = 200
-const KINDS: DemoActivityKind[] = ['register', 'login', 'logout', 'search', 'recommendation', 'profile']
+
+const cache = new Map<string, DemoHistory>()
 
 export function emptyDemoHistory(): DemoHistory {
-  return { searches: [], recommendations: [], activities: [] }
+  return {
+    searches: [],
+    recommendations: [],
+    activities: [],
+  }
 }
 
-function storageKey(): string | null {
-  if (typeof window === 'undefined') return null
-  const user = getDemoSession()
-  return user ? PREFIX + encodeURIComponent(user.email.trim().toLowerCase()) : null
+function currentUid() {
+  return auth.currentUser?.uid ?? null
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-function isTrack(value: unknown): value is DemoTrack {
-  return isRecord(value) && typeof value.index === 'number' &&
-    typeof value.name === 'string' && typeof value.artists === 'string' &&
-    typeof value.cluster === 'number'
+function id() {
+  return crypto.randomUUID()
 }
 
-function isRecommended(value: unknown): value is DemoRecommendedTrack {
-  if (!isRecord(value)) return false
+function notify() {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(
+      new Event('spotify-analytics-demo-history-updated')
+    )
+  }
+}
 
-  const validRecommendation =
-    typeof value.rank === 'number' &&
-    typeof value.similarity === 'number'
+function reportError(error: unknown) {
+  console.error('Firebase history error:', error)
 
-  return validRecommendation && isTrack(value)
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(
+      new CustomEvent('spotify-history-error', {
+        detail: error instanceof Error
+          ? error.message
+          : 'Gagal menyinkronkan riwayat Firebase.',
+      })
+    )
+  }
 }
-function isSearch(value: unknown): value is DemoSearchEntry {
-  return isRecord(value) && typeof value.id === 'string' && typeof value.at === 'string' &&
-    typeof value.query === 'string' && isTrack(value.track)
+
+function getCache(uid: string): DemoHistory {
+  if (!cache.has(uid)) {
+    cache.set(uid, emptyDemoHistory())
+  }
+  return cache.get(uid)!
 }
-function isRecommendation(value: unknown): value is DemoRecommendationEntry {
-  return isRecord(value) && typeof value.id === 'string' && typeof value.at === 'string' &&
-    isTrack(value.seed) && (value.mode === 'cluster' || value.mode === 'all') &&
-    typeof value.requested === 'number' && Array.isArray(value.results) &&
-    value.results.every(isRecommended)
-}
-function isActivity(value: unknown): value is DemoActivityEntry {
-  return isRecord(value) && typeof value.id === 'string' && typeof value.at === 'string' &&
-    KINDS.includes(value.kind as DemoActivityKind) &&
-    typeof value.title === 'string' && typeof value.detail === 'string'
+
+function store(
+  section: DemoHistorySection,
+  entry: DemoSearchEntry | DemoRecommendationEntry | DemoActivityEntry
+) {
+  const uid = currentUid()
+  if (!uid) return false
+
+  const history = getCache(uid)
+  const maximum = {
+    searches: MAX_SEARCHES,
+    recommendations: MAX_RECOMMENDATIONS,
+    activities: MAX_ACTIVITIES,
+  }[section]
+
+  // Update tampilan sementara
+  ;(history[section] as Array<typeof entry>).unshift(entry)
+  ;(history[section] as Array<typeof entry>).splice(maximum)
+  notify()
+
+  // Simpan permanen ke Firestore
+  void setDoc(
+    doc(db, 'users', uid, section, entry.id),
+    entry
+  ).catch(reportError)
+
+  return true
 }
 
 export function getDemoHistory(): DemoHistory {
-  const key = storageKey()
-  if (!key) return emptyDemoHistory()
-  try {
-    const stored: unknown = JSON.parse(window.localStorage.getItem(key) ?? 'null')
-    if (!isRecord(stored)) return emptyDemoHistory()
-    return {
-      searches: Array.isArray(stored.searches) ? stored.searches.filter(isSearch).slice(0, MAX_SEARCHES) : [],
-      recommendations: Array.isArray(stored.recommendations) ? stored.recommendations.filter(isRecommendation).slice(0, MAX_RECOMMENDATIONS) : [],
-      activities: Array.isArray(stored.activities) ? stored.activities.filter(isActivity).slice(0, MAX_ACTIVITIES) : [],
-    }
-  } catch {
-    return emptyDemoHistory()
+  const uid = currentUid()
+  if (!uid) return emptyDemoHistory()
+
+  return {
+    searches: [...getCache(uid).searches],
+    recommendations: [...getCache(uid).recommendations],
+    activities: [...getCache(uid).activities],
   }
 }
 
-function save(history: DemoHistory): boolean {
-  const key = storageKey()
-  if (!key) return false
-  try {
-    window.localStorage.setItem(key, JSON.stringify(history))
-    window.dispatchEvent(new Event('spotify-analytics-demo-history-updated'))
-    return true
-  } catch {
-    return false // Penyimpanan diblokir atau kuota browser penuh
-  }
-}
-function uid(): string {
-  return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
-}
-function activity(kind: DemoActivityKind, title: string, detail: string): DemoActivityEntry {
-  return { id: uid(), at: new Date().toISOString(), kind, title, detail }
-}
-
-export function recordDemoActivity(kind: DemoActivityKind, title: string, detail = ''): boolean {
-  if (!storageKey()) return false
-  const history = getDemoHistory()
-  history.activities.unshift(activity(kind, title, detail))
-  history.activities = history.activities.slice(0, MAX_ACTIVITIES)
-  return save(history)
-}
-
-export function recordDemoSearch(query: string, track: DemoTrack): boolean {
-  if (!storageKey()) return false
-  const history = getDemoHistory()
-  history.searches.unshift({
-    id: uid(), at: new Date().toISOString(), query: query.trim().slice(0, 200),
-    track: { index: track.index, name: track.name, artists: track.artists, cluster: track.cluster },
+export function recordDemoActivity(
+  kind: DemoActivityKind,
+  title: string,
+  detail = ''
+): boolean {
+  return store('activities', {
+    id: id(),
+    at: new Date().toISOString(),
+    kind,
+    title,
+    detail,
   })
-  history.searches = history.searches.slice(0, MAX_SEARCHES)
-  history.activities.unshift(activity('search', 'Memilih lagu dari pencarian', `${track.name} — ${track.artists}`))
-  history.activities = history.activities.slice(0, MAX_ACTIVITIES)
-  return save(history)
+}
+
+export function recordDemoSearch(
+  searchQuery: string,
+  track: DemoTrack
+): boolean {
+  const saved = store('searches', {
+    id: id(),
+    at: new Date().toISOString(),
+    query: searchQuery.trim().slice(0, 200),
+    track: {
+      index: track.index,
+      name: track.name,
+      artists: track.artists,
+      cluster: track.cluster,
+    },
+  })
+
+  if (saved) {
+    recordDemoActivity(
+      'search',
+      'Memilih lagu dari pencarian',
+      `${track.name} — ${track.artists}`
+    )
+  }
+
+  return saved
 }
 
 export function recordDemoRecommendation(input: {
@@ -147,38 +202,147 @@ export function recordDemoRecommendation(input: {
   requested: number
   results: DemoRecommendedTrack[]
 }): boolean {
-  if (!storageKey()) return false
-  const history = getDemoHistory()
-  history.recommendations.unshift({
-    id: uid(), at: new Date().toISOString(),
-    seed: { index: input.seed.index, name: input.seed.name, artists: input.seed.artists, cluster: input.seed.cluster },
-    mode: input.mode, requested: input.requested,
+  const saved = store('recommendations', {
+    id: id(),
+    at: new Date().toISOString(),
+    seed: {
+      index: input.seed.index,
+      name: input.seed.name,
+      artists: input.seed.artists,
+      cluster: input.seed.cluster,
+    },
+    mode: input.mode,
+    requested: input.requested,
     results: input.results.slice(0, 20).map(item => ({
-      index: item.index, name: item.name, artists: item.artists, cluster: item.cluster,
-      rank: item.rank, similarity: item.similarity,
+      index: item.index,
+      name: item.name,
+      artists: item.artists,
+      cluster: item.cluster,
+      rank: item.rank,
+      similarity: item.similarity,
     })),
   })
-  history.recommendations = history.recommendations.slice(0, MAX_RECOMMENDATIONS)
-  history.activities.unshift(activity('recommendation', 'Menjalankan rekomendasi',
-    `${input.seed.name} — ${input.results.length} lagu (${input.mode === 'cluster' ? 'Filter cluster' : 'Semua lagu'})`))
-  history.activities = history.activities.slice(0, MAX_ACTIVITIES)
-  return save(history)
+
+  if (saved) {
+    recordDemoActivity(
+      'recommendation',
+      'Menjalankan rekomendasi',
+      `${input.seed.name} — ${input.results.length} lagu`
+    )
+  }
+
+  return saved
 }
 
-export function deleteDemoHistoryEntry(section: DemoHistorySection, id: string): boolean {
-  if (!storageKey()) return false
-  const history = getDemoHistory()
-  if (section === 'searches') history.searches = history.searches.filter(item => item.id !== id)
-  else if (section === 'recommendations') history.recommendations = history.recommendations.filter(item => item.id !== id)
-  else history.activities = history.activities.filter(item => item.id !== id)
-  return save(history)
+export function deleteDemoHistoryEntry(
+  section: DemoHistorySection,
+  entryId: string
+): boolean {
+  const uid = currentUid()
+  if (!uid) return false
+
+  const history = getCache(uid)
+  ;(history[section] as Array<{ id: string }>) =
+    history[section].filter(item => item.id !== entryId)
+
+  notify()
+
+  void deleteDoc(
+    doc(db, 'users', uid, section, entryId)
+  ).catch(reportError)
+
+  return true
 }
 
-export function clearDemoHistorySection(section: DemoHistorySection): boolean {
-  if (!storageKey()) return false
-  const history = getDemoHistory()
-  if (section === 'searches') history.searches = []
-  else if (section === 'recommendations') history.recommendations = []
-  else history.activities = []
-  return save(history)
+export function clearDemoHistorySection(
+  section: DemoHistorySection
+): boolean {
+  const uid = currentUid()
+  if (!uid) return false
+
+  const entries = [...getCache(uid)[section]]
+  getCache(uid)[section] = [] as never
+  notify()
+
+  void Promise.all(
+    entries.map(entry =>
+      deleteDoc(doc(db, 'users', uid, section, entry.id))
+    )
+  ).catch(reportError)
+
+  return true
+}
+
+// Sinkronisasi langsung Firestore ke tampilan dashboard
+export function subscribeDemoHistory(
+  onUpdate: (history: DemoHistory) => void,
+  onError?: (message: string) => void
+): Unsubscribe {
+  let listeners: Unsubscribe[] = []
+
+  const stopListeners = () => {
+    listeners.forEach(stop => stop())
+    listeners = []
+  }
+
+  const stopAuth = onAuthStateChanged(auth, user => {
+    stopListeners()
+
+    if (!user) {
+      onUpdate(emptyDemoHistory())
+      return
+    }
+
+    const uid = user.uid
+    onUpdate(getDemoHistory())
+
+    const sections: DemoHistorySection[] = [
+      'searches',
+      'recommendations',
+      'activities',
+    ]
+
+    sections.forEach(section => {
+      const maximum = {
+        searches: MAX_SEARCHES,
+        recommendations: MAX_RECOMMENDATIONS,
+        activities: MAX_ACTIVITIES,
+      }[section]
+
+      const historyQuery = query(
+        collection(db, 'users', uid, section),
+        orderBy('at', 'desc'),
+        limit(maximum)
+      )
+
+      const unsubscribe = onSnapshot(
+        historyQuery,
+        snapshot => {
+          const items = snapshot.docs.map(snapshotDoc => ({
+            ...snapshotDoc.data(),
+            id: snapshotDoc.id,
+          }))
+
+          const history = getCache(uid)
+          ;(history as Record<string, unknown>)[section] = items
+
+          if (currentUid() === uid) {
+            onUpdate(getDemoHistory())
+            notify()
+          }
+        },
+        error => {
+          reportError(error)
+          onError?.(error.message)
+        }
+      )
+
+      listeners.push(unsubscribe)
+    })
+  })
+
+  return () => {
+    stopAuth()
+    stopListeners()
+  }
 }

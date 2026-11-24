@@ -8,10 +8,10 @@ from sqlalchemy.engine import URL
 # =====================================================
 
 DB_USER = "postgres"
-DB_PASSWORD = "pSiakl4_?"
+DB_PASSWORD = "Kopisusu18."
 DB_HOST = "localhost"
 DB_PORT = 5432
-DB_NAME = "spotify_recommender"
+DB_NAME = "spotify_postgresql."
 CSV_PATH = "data_clean/tracks_clean.csv"
 CHUNK_SIZE = 10000
 if not DB_PASSWORD:

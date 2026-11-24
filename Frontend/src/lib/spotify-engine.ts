@@ -1,3 +1,4 @@
+
 import 'server-only'
 
 import fs from 'node:fs'
@@ -18,7 +19,8 @@ import {
   type Song,
 } from './spotify-types'
 
-const DATA_DIR = path.resolve(process.cwd(), '..', 'spotify-recommender')
+// Lokasi dataset asli berada satu tingkat di atas Frontend
+const DATA_DIR = path.resolve(process.cwd(), '..')
 
 const CLUSTER_DIR = path.join(
   DATA_DIR,
@@ -504,12 +506,11 @@ class SpotifyEngine {
         artists: new Set(this.songs.map((song) => song.artists)).size,
         clusters: this.clusters.length,
         yearMin: years.length
-        ? years.reduce((min, year) => Math.min(min, year), Infinity)
-        : null,
-
+          ? years.reduce((min, year) => Math.min(min, year), Infinity)
+          : null,
         yearMax: years.length
-        ? years.reduce((max, year) => Math.max(max, year), -Infinity)
-        : null,
+          ? years.reduce((max, year) => Math.max(max, year), -Infinity)
+          : null,
       },
       clusterCounts: counts.map((item) => ({
         ...item,

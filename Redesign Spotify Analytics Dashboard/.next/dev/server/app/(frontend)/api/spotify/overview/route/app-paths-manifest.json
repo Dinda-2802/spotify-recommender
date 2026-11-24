@@ -1,0 +1,3 @@
+{
+  "/(frontend)/api/spotify/overview/route": "app/(frontend)/api/spotify/overview/route.js"
+}
